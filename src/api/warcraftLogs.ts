@@ -44,7 +44,7 @@ export async function queryWarcraftLogs<T>(
 ): Promise<T> {
   const token = await getAccessToken();
 
-  const response = await fetch('/api/graphql', {
+  const response = await fetch('https://www.warcraftlogs.com/api/v2/client', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
