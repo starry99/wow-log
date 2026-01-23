@@ -1,15 +1,9 @@
 import { useState, useMemo } from 'react';
 import type { SeasonClearStatus, SearchParams, SeasonData, AnalysisResult } from '../types';
 import { getZoneData, getCharacterRankings, fetchDetailedAnalysis } from '../api/warcraftLogs';
-import { SeasonTable, calculateKrFirstKillDiffWeek } from './SeasonTable';
+import { SeasonTable } from './SeasonTable';
 import { 
   getBossPercentWeights, 
-  calculateDebuffScore, 
-  SEASON_2_ANALYSIS_WEIGHTS,
-  SEASON_3_ANALYSIS_WEIGHTS,
-  calculatePhaseDamageScore,
-  calculateAnalysisScore,
-  calculateKillWeekScore,
 } from '../config/scoreSettings';
 
 // 서버 이름 → slug 변환 (한국 서버)
@@ -117,111 +111,13 @@ export function SeasonCard({ status, searchParams, classID }: SeasonCardProps) {
   }, [seasonData, status.zoneId]);
 
   // 추가평가 점수 계산
-  const additionalScore = useMemo(() => {
-    if (!seasonData) return 0;
 
-    // Season 2: 1넴 디버프 등
-    if (status.zoneId === 42) {
-      const debuffValue = seasonData.analysisData?.boss1AvgDebuff;
-      if (debuffValue === undefined) return 0;
-      
-      const debuffScore = calculateDebuffScore(debuffValue);
-      const debuffWeight = SEASON_2_ANALYSIS_WEIGHTS.find(w => w.cellId === 'boss1_debuff')?.weight ?? 20;
-      return debuffScore * (debuffWeight / 100);
-    }
-
-    // Season 3: 막넴 분석 (딜량 + 주차)
-    if (status.zoneId === 44) {
-      const scoreMap = new Map<string, number>();
-
-      const boss8Kills = seasonData.analysisData?.boss8KillDetails;
-      const firstKill = (boss8Kills && boss8Kills.length > 0) 
-         ? [...boss8Kills].sort((a, b) => a.startTime - b.startTime)[0] 
-         : undefined;
-
-      // 1. Phase Damage Score
-      if (seasonData.analysisData?.boss8PhaseDamage !== undefined) {
-          const damage = seasonData.analysisData.boss8PhaseDamage;
-          const score = calculatePhaseDamageScore(damage, classID, firstKill?.spec);
-          scoreMap.set('boss8_phase_damage', score);
-      }
-
-      // 2. Kill Week Score
-      if (firstKill) {
-         const diffWeek = calculateKrFirstKillDiffWeek(firstKill.startTime, status.zoneId);
-         if (diffWeek !== null) {
-            const score = calculateKillWeekScore(diffWeek + 1);
-            scoreMap.set('boss8_kill_week', score);
-         }
-      }
-      
-      return calculateAnalysisScore(scoreMap, SEASON_3_ANALYSIS_WEIGHTS);
-    }
-
-    return 0;
-  }, [seasonData, status.zoneId, classID]);
 
   // 탱커 스펙 여부 확인 (마지막 보스 퍼킬이 탱커인 경우)
-  const isTankSpec = useMemo(() => {
-    if (!seasonData?.bossRankings || seasonData.bossRankings.length === 0) return false;
-    const lastBoss = seasonData.bossRankings[seasonData.bossRankings.length - 1];
-    
-    const tankKill = lastBoss.roles.Tank?.firstKillTimestamp;
-    if (!tankKill) return false;
-    
-    // 다른 역할보다 빠른지 확인
-    const dpsKill = lastBoss.roles.DPS?.firstKillTimestamp;
-    const healerKill = lastBoss.roles.Healer?.firstKillTimestamp;
-    
-    if (dpsKill && dpsKill < tankKill) return false;
-    if (healerKill && healerKill < tankKill) return false;
-    
-    return true;
-  }, [seasonData]);
 
-  // 탱커용 점수 계산
-  const tankScores = useMemo(() => {
-    if (!seasonData || !isTankSpec) return { dps: 0, hps: 0 };
-    
-    const weights = getBossPercentWeights(status.zoneId);
-    let totalWeight = 0;
-    let dpsSum = 0;
-    let hpsSum = 0;
-    
-    seasonData.bossRankings.forEach(boss => {
-      const weightConfig = weights.find(w => w.encounterId === boss.encounterId);
-      const w = weightConfig?.weight ?? 1;
-      
-      const tankData = boss.roles.Tank;
-      if (tankData) {
-         const d = tankData.dpsRankPercent ?? 0;
-         const h = tankData.hpsRankPercent ?? 0;
-         
-         if (d > 0 || h > 0) {
-            dpsSum += d * w;
-            hpsSum += h * w;
-            totalWeight += w;
-         }
-      }
-    });
-    
-    return {
-       dps: totalWeight > 0 ? dpsSum / totalWeight : 0,
-       hps: totalWeight > 0 ? hpsSum / totalWeight : 0
-    };
-  }, [seasonData, isTankSpec, status.zoneId]);
 
   // 종합 점수 계산
-  const totalScore = useMemo(() => {
-    if (isTankSpec) {
-        return (tankScores.dps * 0.7) + (tankScores.hps * 0.3);
-    }
 
-    if (additionalScore > 0) {
-      return (bestPercentScore * 0.7) + (additionalScore * 0.3);
-    }
-    return bestPercentScore;
-  }, [bestPercentScore, additionalScore, isTankSpec, tankScores]);
 
   const handleLoadDetails = async () => {
     if (loading || !searchParams) return;

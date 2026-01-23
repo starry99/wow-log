@@ -10,7 +10,6 @@ import {
   SEASON_2_ANALYSIS_WEIGHTS,
   getBossPercentWeights,
   getRecommendedHealers,
-  calculateKillWeekScore,
 } from '../config/scoreSettings';
 import { getSpecImage, HIDDEN_ANALYSIS_CONFIG, HEALER_SPECS, HEALER_PHASE_DAMAGE_THRESHOLDS, CLASS_INFO, TANK_SPECS } from '../config/classSpecs';
 import { fetchDetailedAnalysis } from '../api/warcraftLogs';
@@ -1154,7 +1153,6 @@ export function SeasonTable({ season, classID, analysisResult, onSeasonUpdate, s
                           
                           const weekLabel = diffWeek <= 0 ? "한퍼킬 주차" : `한퍼킬 후 ${diffWeek}주차`;
                           // diffWeek=0 -> 1주차 점수, diffWeek=1 -> 2주차 점수
-                          const score = calculateKillWeekScore(diffWeek + 1);
                           
                           return (
                               <div className="flex justify-between items-start mt-1 mb-1 text-sm">
