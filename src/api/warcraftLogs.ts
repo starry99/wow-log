@@ -15,22 +15,12 @@ async function getAccessToken(): Promise<string> {
     return cachedToken;
   }
 
-  const clientId = import.meta.env.VITE_WCL_CLIENT_ID;
-  const clientSecret = import.meta.env.VITE_WCL_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret) {
-    throw new Error('Warcraft Logs API credentials not configured.');
-  }
-
-  const credentials = btoa(`${clientId}:${clientSecret}`);
-
-  const response = await fetch('/api/oauth/token', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${credentials}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
+  /* 
+   * Vercel Serverless Function을 통해 토큰 발급
+   * 클라이언트 측에서 Secret Key를 노출하지 않기 위함
+   */
+  const response = await fetch('/api/token', {
+    method: 'GET', // Serverless Function은 GET으로 호출해도 됨 (내부적으로 처리)
   });
 
   if (!response.ok) {
