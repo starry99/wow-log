@@ -6,6 +6,7 @@ import { HEALER_SPECS, TANK_SPECS } from '../config/classSpecs';
 
 let cachedToken: string | null = null;
 let tokenExpiry: number = 0;
+let inFlightTokenRequest: Promise<string> | null = null;
 
 /**
  * OAuth2 Access Token 가져오기
@@ -15,32 +16,49 @@ async function getAccessToken(): Promise<string> {
     return cachedToken;
   }
 
-  /* 
-   * Vercel Serverless Function을 통해 토큰 발급
-   * 클라이언트 측에서 Secret Key를 노출하지 않기 위함
-   */
-  const response = await fetch('/api/token', {
-    method: 'GET', // Serverless Function은 GET으로 호출해도 됨 (내부적으로 처리)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Failed to get access token: ${response.status} ${errorText}`);
+  if (inFlightTokenRequest) {
+    return inFlightTokenRequest;
   }
 
-  const data = await response.json();
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
+  inFlightTokenRequest = (async () => {
+    /* 
+     * Vercel Serverless Function을 통해 토큰 발급
+     * 클라이언트 측에서 Secret Key를 노출하지 않기 위함
+     */
+    const response = await fetch('/api/token', {
+      method: 'GET', // Serverless Function은 GET으로 호출해도 됨 (내부적으로 처리)
+    });
 
-  return data.access_token;
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to get access token: ${response.status} ${errorText}`);
+    }
+
+    const data = await response.json();
+    cachedToken = data.access_token;
+    tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
+
+    return data.access_token;
+  })();
+
+  try {
+    return await inFlightTokenRequest;
+  } finally {
+    inFlightTokenRequest = null;
+  }
 }
 
 /**
  * GraphQL 쿼리 실행
  */
+type QueryWarcraftLogsOptions = {
+  allowPartialErrors?: boolean;
+};
+
 export async function queryWarcraftLogs<T>(
   query: string,
-  variables?: Record<string, unknown>
+  variables?: Record<string, unknown>,
+  options?: QueryWarcraftLogsOptions
 ): Promise<T> {
   const token = await getAccessToken();
 
@@ -60,7 +78,7 @@ export async function queryWarcraftLogs<T>(
 
   const result = await response.json();
 
-  if (result.errors) {
+  if (result.errors && !options?.allowPartialErrors) {
     throw new Error(`GraphQL errors: ${JSON.stringify(result.errors)}`);
   }
 
@@ -120,6 +138,91 @@ export const ZONE_DATA: ZoneData[] = [
  */
 export function getZoneData(): ZoneData[] {
   return ZONE_DATA;
+}
+
+const REPORT_QUERY_BATCH_SIZE = 20;
+const REPORT_QUERY_CONCURRENCY = 2;
+const DUPLICATE_KILL_WINDOW_MS = 60_000;
+
+type RankWithReport = {
+  report?: { code: string; fightID: number };
+  startTime?: number;
+};
+
+type ReportFightInfo = {
+  code: string;
+  fightID: number;
+  startTime: number;
+};
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+function collectUniqueReportsWithFightDedup(
+  ranks: RankWithReport[]
+): ReportFightInfo[] {
+  const sortedReports = ranks
+    .filter(rank => rank.report?.code && rank.report?.fightID)
+    .map(rank => ({
+      code: rank.report!.code,
+      fightID: rank.report!.fightID,
+      startTime: rank.startTime ?? 0,
+    }))
+    .sort((a, b) => a.startTime - b.startTime);
+
+  const dedupedReports: ReportFightInfo[] = [];
+
+  for (const report of sortedReports) {
+    const isDuplicate = dedupedReports.some(existing => {
+      if (existing.code === report.code && existing.fightID === report.fightID) {
+        return true;
+      }
+
+      if (existing.startTime > 0 && report.startTime > 0) {
+        return Math.abs(existing.startTime - report.startTime) < DUPLICATE_KILL_WINDOW_MS;
+      }
+
+      return false;
+    });
+
+    if (!isDuplicate) {
+      dedupedReports.push(report);
+    }
+  }
+
+  return dedupedReports;
 }
 
 /**
@@ -218,44 +321,35 @@ export async function getCharacterRankings(
     });
   });
 
-  // 쿼리 생성 함수
-  const buildQuery = (metric: 'dps' | 'hps') => {
-    const encounterQueries = encounterMapping.map(({ encounterId }) => {
-      const alias = `boss_${encounterId}_${metric}`;
-      return `${alias}: encounterRankings(encounterID: ${encounterId}, difficulty: 5, partition: -1, metric: ${metric})`;
-    });
+  // 보스별 DPS/HPS metric을 하나의 요청으로 조회
+  const encounterQueries = encounterMapping.flatMap(({ encounterId }) => {
+    return [
+      `boss_${encounterId}_dps: encounterRankings(encounterID: ${encounterId}, difficulty: 5, partition: -1, metric: dps)`,
+      `boss_${encounterId}_hps: encounterRankings(encounterID: ${encounterId}, difficulty: 5, partition: -1, metric: hps)`,
+    ];
+  });
 
-    return `
-      query GetCharacterRankings($name: String!, $serverSlug: String!, $serverRegion: String!) {
-        characterData {
-          character(name: $name, serverSlug: $serverSlug, serverRegion: $serverRegion) {
-            name
-            classID
-            ${encounterQueries.join('\n            ')}
-          }
+  const query = `
+    query GetCharacterRankings($name: String!, $serverSlug: String!, $serverRegion: String!) {
+      characterData {
+        character(name: $name, serverSlug: $serverSlug, serverRegion: $serverRegion) {
+          name
+          classID
+          ${encounterQueries.join('\n          ')}
         }
       }
-    `;
-  };
+    }
+  `;
 
-  // DPS metric 쿼리 실행
-  const dpsQuery = buildQuery('dps');
-  const dpsResult = await queryWarcraftLogs<{
+  const result = await queryWarcraftLogs<{
     characterData: { character: Record<string, unknown> | null };
-  }>(dpsQuery, { name, serverSlug, serverRegion });
+  }>(query, { name, serverSlug, serverRegion });
 
-  if (!dpsResult.characterData.character) {
+  if (!result.characterData.character) {
     return null;
   }
 
-  // HPS metric 쿼리 실행
-  const hpsQuery = buildQuery('hps');
-  const hpsResult = await queryWarcraftLogs<{
-    characterData: { character: Record<string, unknown> | null };
-  }>(hpsQuery, { name, serverSlug, serverRegion });
-
-  const dpsCharacter = dpsResult.characterData.character;
-  const hpsCharacter = hpsResult.characterData.character;
+  const character = result.characterData.character;
 
   // 데이터를 SeasonData 형식으로 변환
   const seasonMap = new Map<number, SeasonData>();
@@ -295,8 +389,8 @@ export async function getCharacterRankings(
     const dpsAlias = `boss_${encounterId}_dps`;
     const hpsAlias = `boss_${encounterId}_hps`;
     
-    const dpsBossData = dpsCharacter[dpsAlias] as BossRankingData;
-    const hpsBossData = hpsCharacter?.[hpsAlias] as BossRankingData;
+    const dpsBossData = character[dpsAlias] as BossRankingData;
+    const hpsBossData = character[hpsAlias] as BossRankingData;
 
     const season = seasonMap.get(zoneId)!;
     
@@ -471,13 +565,13 @@ export async function getCharacterRankings(
 
 
   
-  const playerName = dpsCharacter.name as string;
+  const playerName = character.name as string;
   
   // 상세 분석은 나중에 호출 - 여기서는 기본 데이터만 반환
   // dpsRanksMap, hpsRanksMap은 상세 분석 시 필요하므로 저장
   return {
     playerName,
-    classID: dpsCharacter.classID as number,
+    classID: character.classID as number,
     seasons,
     // 상세 분석용 데이터 - 나중에 fetchDetailedAnalysis에서 사용
     _ranksData: { dpsRanksMap, hpsRanksMap },
@@ -494,26 +588,22 @@ export async function fetchDetailedAnalysis(
   dpsRanksMap: Map<number, Array<{ report?: { code: string; fightID: number } }>>,
   hpsRanksMap: Map<number, Array<{ report?: { code: string; fightID: number } }>>
 ): Promise<void> {
-  // 모든 분석 함수를 병렬로 실행
-  await Promise.all([
-    // Healer Best % 전투에서 힐러 수 조회 (Batch)
+  const analysisTasks: Promise<void>[] = [
+    // 공통 분석
     fetchHealerCountsForSeason(season),
-    
-    // DPS Best % 98 이상일 때 주작 체크
     fetchDpsCheatCheckForSeason(season),
-    
-    // DPS Best % 전투에서 Power Infusion 체크 (Batch)
     fetchPowerInfusionCheckBatch(season, playerName),
-    
-    // 시즌별 추가 분석 데이터 조회 (Season 2)
-    fetchSeasonAnalysis(season, playerName, dpsRanksMap, hpsRanksMap),
-    
-    // Season 1 추가 분석
-    fetchSeason1Analysis(season, playerName, dpsRanksMap, hpsRanksMap),
-  
-    // Season 3 추가 분석
-    fetchSeason3Analysis(season, playerName, dpsRanksMap, hpsRanksMap)
-  ]);
+  ];
+
+  if (season.zoneId === 38) {
+    analysisTasks.push(fetchSeason1Analysis(season, playerName, dpsRanksMap, hpsRanksMap));
+  } else if (season.zoneId === 42) {
+    analysisTasks.push(fetchSeasonAnalysis(season, playerName, dpsRanksMap, hpsRanksMap));
+  } else if (season.zoneId === 44) {
+    analysisTasks.push(fetchSeason3Analysis(season, playerName, dpsRanksMap, hpsRanksMap));
+  }
+
+  await Promise.all(analysisTasks);
 }
 
 /**
@@ -712,6 +802,63 @@ const BOSS_1_DEBUFF_ABILITY_ID = 459445;
 const BOSS_3_DEBUFF_ABILITY_ID = 1217122;
 const BOSS_8_DEBUFF_ABILITY_ID = 1220784; // 사용자 요청 폭탄목걸이 ID
 
+async function fetchDebuffCountsForReports(
+  reports: Array<{ code: string; fightID: number }>,
+  playerNameLower: string,
+  abilityId: number,
+  aliasPrefix: string
+): Promise<Array<number | null>> {
+  if (reports.length === 0) return [];
+
+  const reportChunks = chunkArray(reports, REPORT_QUERY_BATCH_SIZE);
+  const chunkResults = await mapWithConcurrency(
+    reportChunks,
+    REPORT_QUERY_CONCURRENCY,
+    async (chunk, chunkIndex): Promise<Array<number | null>> => {
+      const reportQueries = chunk.map((report, index) => `
+        ${aliasPrefix}_${chunkIndex}_${index}: report(code: "${report.code}") {
+          table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${abilityId})
+        }
+      `).join('\n');
+
+      const query = `
+        query GetDebuffCountsBatch {
+          reportData {
+            ${reportQueries}
+          }
+        }
+      `;
+
+      try {
+        const result = await queryWarcraftLogs<{
+          reportData?: Record<string, {
+            table?: {
+              data?: {
+                auras?: Array<{ name: string; totalUses?: number }>;
+              };
+            };
+          } | null>;
+        }>(query, {}, { allowPartialErrors: true });
+
+        return chunk.map((_, index) => {
+          const reportData = result.reportData?.[`${aliasPrefix}_${chunkIndex}_${index}`];
+          if (!reportData || !reportData.table) {
+            return null;
+          }
+
+          const auras = reportData.table.data?.auras || [];
+          const playerAura = auras.find(aura => aura.name.toLowerCase() === playerNameLower);
+          return playerAura?.totalUses ?? 0;
+        });
+      } catch {
+        return chunk.map(() => null);
+      }
+    }
+  );
+
+  return chunkResults.flat();
+}
+
 /**
  * 시즌별 추가 분석 데이터 조회
  * Season 2: 1넴, 3넴 모든 킬에서 평균 디버프 수 계산 (한번에 처리)
@@ -730,20 +877,10 @@ async function fetchSeasonAnalysis(
   const collectReports = (bossId: number): Array<{ code: string; fightID: number; startTime: number }> => {
     const dpsRanks = dpsRanksMap.get(bossId) || [];
     const hpsRanks = hpsRanksMap.get(bossId) || [];
-    const reportsMap = new Map<string, { code: string; fightID: number; startTime: number }>();
-    
-    [...dpsRanks, ...hpsRanks].forEach(rank => {
-      if (rank.report?.code && rank.report?.fightID) {
-        const key = `${rank.report.code}-${rank.report.fightID}`;
-        reportsMap.set(key, { 
-            code: rank.report.code, 
-            fightID: rank.report.fightID,
-            startTime: (rank as any).startTime || 0
-        });
-      }
-    });
-    
-    return Array.from(reportsMap.values());
+    return collectUniqueReportsWithFightDedup([
+      ...(dpsRanks as RankWithReport[]),
+      ...(hpsRanks as RankWithReport[]),
+    ]);
   };
   
   const boss1Reports = collectReports(SEASON_2_BOSS_1_ID);
@@ -753,122 +890,106 @@ async function fetchSeasonAnalysis(
   if (boss1Reports.length === 0 && boss3Reports.length === 0 && boss8Reports.length === 0) {
     return;
   }
-
-  // 개별 리포트 디버프 조회 함수
-  const queryDebuffForReport = async (
-    report: { code: string; fightID: number },
-    abilityId: number
-  ): Promise<number | null> => {
-    try {
-      const query = `
-        query GetDebuffTable {
-          reportData {
-            report(code: "${report.code}") {
-              table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${abilityId})
-            }
-          }
-        }
-      `;
-      
-      const result = await queryWarcraftLogs<{
-        reportData: { report: { table: { data?: { auras?: Array<{ name: string; totalUses: number; guid?: number }> } } } | null };
-      }>(query, {});
-      
-      if (!result.reportData?.report) return null; // 접근 불가
-      
-      const auras = result.reportData.report.table?.data?.auras || [];
-      
-      const playerAura = auras.find(
-        aura => aura.name.toLowerCase() === playerName.toLowerCase()
-      );
-      
-      return playerAura?.totalUses || 0;
-    } catch {
-      return null; // 오류 시 (private 등) null 반환
-    }
-  };
+  const playerNameLower = playerName.toLowerCase();
 
   // 1넴 상세 분석 (Batch Query)
   const boss1KillDetails: any[] = [];
   let boss1Avg = 0;
 
   if (boss1Reports.length > 0) {
-      const reportQueries = boss1Reports.map((r, i) => `
-          boss1_${i}: report(code: "${r.code}") {
-              table(fightIDs: [${r.fightID}], dataType: Debuffs, abilityID: ${BOSS_1_DEBUFF_ABILITY_ID})
-          }
-      `).join('\n');
-      
-      const batchQuery = `query GetBoss1Debuffs { reportData { ${reportQueries} } }`;
-      
       try {
-          const result = await queryWarcraftLogs<any>(batchQuery, {});
-          let myTotalDebuffs = 0;
+          const reportChunks = chunkArray(boss1Reports, REPORT_QUERY_BATCH_SIZE);
+          const boss1ChunkResults = await mapWithConcurrency(
+            reportChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (chunk, chunkIndex): Promise<{ totalDebuffs: number; validKills: number; details: any[] }> => {
+              const reportQueries = chunk.map((report, index) => `
+                  boss1_${chunkIndex}_${index}: report(code: "${report.code}") {
+                      table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${BOSS_1_DEBUFF_ABILITY_ID})
+                  }
+              `).join('\n');
+
+              const batchQuery = `query GetBoss1Debuffs { reportData { ${reportQueries} } }`;
+              const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+              let totalDebuffs = 0;
+              let validKills = 0;
+              const details: any[] = [];
+
+              chunk.forEach((report, index) => {
+                const data = result.reportData?.[`boss1_${chunkIndex}_${index}`];
+                const auras = data?.table?.data?.auras || [];
+
+                const breakdown = auras.map((a: any) => ({
+                  name: a.name,
+                  className: a.type || 'Unknown',
+                  icon: a.icon || '',
+                  count: a.totalUses
+                })).sort((a: any, b: any) => b.count - a.count);
+
+                const myEntry = breakdown.find((entry: any) => entry.name.toLowerCase() === playerNameLower);
+                if (myEntry) {
+                  totalDebuffs += myEntry.count;
+                }
+                validKills++;
+
+                details.push({
+                  code: report.code,
+                  fightID: report.fightID,
+                  startTime: report.startTime,
+                  debuffBreakdown: breakdown
+                });
+              });
+
+              return { totalDebuffs, validKills, details };
+            }
+          );
+
+          let totalDebuffs = 0;
           let validKills = 0;
-          
-          boss1Reports.forEach((r, i) => {
-               const data = result.reportData?.[`boss1_${i}`];
-               const auras = data?.table?.data?.auras || [];
-               
-               const breakdown = auras.map((a: any) => ({
-                   name: a.name,
-                   className: a.type || 'Unknown',
-                   icon: a.icon || '',
-                   count: a.totalUses
-               })).sort((a: any, b: any) => b.count - a.count);
-               
-               // 본인 카운트 집계
-               const myEntry = breakdown.find((b: any) => b.name.toLowerCase() === playerName.toLowerCase());
-               if (myEntry) {
-                   myTotalDebuffs += myEntry.count;
-               }
-               validKills++;
-               
-               boss1KillDetails.push({
-                   code: r.code,
-                   fightID: r.fightID,
-                   startTime: r.startTime,
-                   debuffBreakdown: breakdown
-               });
+          boss1ChunkResults.forEach(chunkResult => {
+            totalDebuffs += chunkResult.totalDebuffs;
+            validKills += chunkResult.validKills;
+            boss1KillDetails.push(...chunkResult.details);
           });
-          
+
           if (validKills > 0) {
-              boss1Avg = myTotalDebuffs / validKills;
+            boss1Avg = totalDebuffs / validKills;
           }
-      } catch (e) {
+      } catch {
           // console.error("Boss 1 Batch Error", e);
       }
   }
 
-  // 3, 8넴 병렬 조회 (1넴 제외됨)
-  const [boss3Results, boss8Results] = await Promise.all([
-    Promise.allSettled(boss3Reports.map(r => queryDebuffForReport(r, BOSS_3_DEBUFF_ABILITY_ID))),
-    Promise.allSettled(boss8Reports.map(r => queryDebuffForReport(r, BOSS_8_DEBUFF_ABILITY_ID)))
+  // 3, 8넴 디버프 분석 (Chunk Batch)
+  const [boss3Counts, boss8Counts] = await Promise.all([
+    fetchDebuffCountsForReports(boss3Reports, playerNameLower, BOSS_3_DEBUFF_ABILITY_ID, 'boss3'),
+    fetchDebuffCountsForReports(boss8Reports, playerNameLower, BOSS_8_DEBUFF_ABILITY_ID, 'boss8'),
   ]);
 
   // 평균 집계 함수 (1, 3넴용)
-  const aggregateResults = (results: PromiseSettledResult<number | null>[]): { total: number; valid: number } => {
+  const aggregateResults = (results: Array<number | null>): { total: number; valid: number } => {
     let total = 0;
     let valid = 0;
     for (const result of results) {
-      if (result.status === 'fulfilled' && result.value !== null) {
-        total += result.value;
+      if (result !== null) {
+        total += result;
         valid++;
       }
     }
     return { total, valid };
   };
 
-  const boss3Agg = aggregateResults(boss3Results);
+  const boss3Agg = aggregateResults(boss3Counts);
   const boss3Avg = boss3Agg.valid > 0 ? boss3Agg.total / boss3Agg.valid : 0;
 
   // 8넴 집계 (특임 횟수 카운트)
   let boss8BombCount = 0;
   let boss8TotalKills = 0;
-  for (const result of boss8Results) {
-    if (result.status === 'fulfilled' && result.value !== null) {
+  for (const result of boss8Counts) {
+    if (result !== null) {
       boss8TotalKills++;
-      if (result.value >= 1) { // 1회 이상이면 true
+      if (result >= 1) { // 1회 이상이면 true
         boss8BombCount++;
       }
     }
@@ -879,33 +1000,41 @@ async function fetchSeasonAnalysis(
   const boss8DamageTakenDetails: any[] = [];
   if (boss8Reports.length > 0) {
       try {
-          const reportQueries = boss8Reports.map((r, i) => `
-              boss8_dmg_${i}: report(code: "${r.code}") {
-                  table(fightIDs: [${r.fightID}], dataType: DamageTaken, abilityID: 1218703)
-              }
-          `).join('\n');
-          
-          const batchQuery = `query GetBoss8DamageTaken { reportData { ${reportQueries} } }`;
-          const result = await queryWarcraftLogs<any>(batchQuery, {});
-          
-          boss8Reports.forEach((r, i) => {
-               const table = result.reportData?.[`boss8_dmg_${i}`]?.table;
-               const entries = table?.data?.entries || [];
-               
-               const breakdown = entries.map((e: any) => ({
-                   name: e.name,
-                   className: e.type,
-                   icon: e.icon,
-                   total: e.total
-               })).sort((a: any, b: any) => b.total - a.total);
-               
-               boss8DamageTakenDetails.push({
-                   code: r.code,
-                   fightID: r.fightID,
-                   startTime: r.startTime,
-                   breakdown
-               });
-          });
+          const reportChunks = chunkArray(boss8Reports, REPORT_QUERY_BATCH_SIZE);
+          const chunkDetails = await mapWithConcurrency(
+            reportChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (chunk, chunkIndex): Promise<any[]> => {
+              const reportQueries = chunk.map((report, index) => `
+                boss8_dmg_${chunkIndex}_${index}: report(code: "${report.code}") {
+                    table(fightIDs: [${report.fightID}], dataType: DamageTaken, abilityID: 1218703)
+                }
+              `).join('\n');
+
+              const batchQuery = `query GetBoss8DamageTaken { reportData { ${reportQueries} } }`;
+              const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+              return chunk.map((report, index) => {
+                const table = result.reportData?.[`boss8_dmg_${chunkIndex}_${index}`]?.table;
+                const entries = table?.data?.entries || [];
+
+                const breakdown = entries.map((entry: any) => ({
+                  name: entry.name,
+                  className: entry.type,
+                  icon: entry.icon,
+                  total: entry.total
+                })).sort((a: any, b: any) => b.total - a.total);
+
+                return {
+                  code: report.code,
+                  fightID: report.fightID,
+                  startTime: report.startTime,
+                  breakdown
+                };
+              });
+            }
+          );
+          boss8DamageTakenDetails.push(...chunkDetails.flat());
       } catch (e) {
           // console.error("Boss 8 Damage Taken Batch Error", e);
       }
@@ -928,6 +1057,75 @@ const SEASON_3_BOSS_9_ID = 3135;  // 디멘
 const INFUSED_TANGLE_NAME = "Infused Tangle";
 const BOSS_9_DEBUFF_ABILITY_ID = 1246930; // 8넴 특임 디버프 ID
 const BOSS_9_STAR_DEBUFF_ABILITY_ID = 1254385; // 8넴 별조각 특임 디버프 ID
+
+type Boss8DebuffAnalysis = {
+  special: number;
+  star: number;
+  phase?: { startTime: number; endTime: number };
+};
+
+async function fetchBoss8DebuffAnalysisBatch(
+  reports: Array<{ code: string; fightID: number }>,
+  playerNameLower: string
+): Promise<Boss8DebuffAnalysis[]> {
+  if (reports.length === 0) return [];
+
+  const reportChunks = chunkArray(reports, REPORT_QUERY_BATCH_SIZE);
+  const chunkResults = await mapWithConcurrency(
+    reportChunks,
+    REPORT_QUERY_CONCURRENCY,
+    async (chunk, chunkIndex): Promise<Boss8DebuffAnalysis[]> => {
+      const reportQueries = chunk.map((report, index) => `
+        report_${chunkIndex}_${index}: report(code: "${report.code}") {
+          special: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${BOSS_9_DEBUFF_ABILITY_ID})
+          star: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${BOSS_9_STAR_DEBUFF_ABILITY_ID})
+          phase: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: 1245292, hostilityType: Enemies)
+        }
+      `).join('\n');
+
+      const query = `
+        query GetBoss8DebuffsBatch {
+          reportData {
+            ${reportQueries}
+          }
+        }
+      `;
+
+      try {
+        const result = await queryWarcraftLogs<{
+          reportData?: Record<string, {
+            special?: { data?: { auras?: Array<{ name: string; totalUses: number }> } };
+            star?: { data?: { auras?: Array<{ name: string; totalUses: number }> } };
+            phase?: { data?: { auras?: Array<{ bands?: Array<{ startTime: number; endTime: number }> }> } };
+          } | null>;
+        }>(query, {}, { allowPartialErrors: true });
+
+        return chunk.map((_, index) => {
+          const reportData = result.reportData?.[`report_${chunkIndex}_${index}`];
+
+          if (!reportData) {
+            return { special: 0, star: 0 };
+          }
+
+          const getCount = (auras: Array<{ name: string; totalUses: number }> | undefined) => {
+            return auras?.find(aura => aura.name.toLowerCase() === playerNameLower)?.totalUses || 0;
+          };
+          const phaseBand = reportData.phase?.data?.auras?.[0]?.bands?.[0];
+
+          return {
+            special: getCount(reportData.special?.data?.auras),
+            star: getCount(reportData.star?.data?.auras),
+            phase: phaseBand ? { startTime: phaseBand.startTime, endTime: phaseBand.endTime } : undefined,
+          };
+        });
+      } catch {
+        return chunk.map(() => ({ special: 0, star: 0 }));
+      }
+    }
+  );
+
+  return chunkResults.flat();
+}
 
 
 
@@ -968,50 +1166,60 @@ async function fetchSeason1Analysis(
 
   if (healerKills.length > 0) {
       try {
-          const reportQueries = healerKills.map((kill, idx) => `
-            report_${idx}: report(code: "${kill.code}") {
-                healing: table(fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "${SEASON_1_DEBUFF_ID}")
-                debuffs: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: ${SEASON_1_DEBUFF_ID})
-            }
-          `).join('\n');
+          const killChunks = chunkArray(healerKills, REPORT_QUERY_BATCH_SIZE);
+          const chunkDetails = await mapWithConcurrency(
+            killChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (killChunk, chunkIndex): Promise<any[]> => {
+              const reportQueries = killChunk.map((kill, idx) => `
+                report_${chunkIndex}_${idx}: report(code: "${kill.code}") {
+                    healing: table(fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "${SEASON_1_DEBUFF_ID}")
+                    debuffs: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: ${SEASON_1_DEBUFF_ID})
+                }
+              `).join('\n');
 
-          const batchQuery = `query GetS1Boss6Analysis { reportData { ${reportQueries} } }`;
-          const result = await queryWarcraftLogs<any>(batchQuery, {});
+              const batchQuery = `query GetS1Boss6Analysis { reportData { ${reportQueries} } }`;
+              const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
 
-          healerKills.forEach((kill, idx) => {
-              const rData = result.reportData?.[`report_${idx}`];
-              if (!rData) return;
+              const details: any[] = [];
+              killChunk.forEach((kill, idx) => {
+                const reportData = result.reportData?.[`report_${chunkIndex}_${idx}`];
+                if (!reportData) return;
 
-              const healingEntries = rData.healing?.data?.entries || [];
-              const debuffAuras = rData.debuffs?.data?.auras || [];
+                const healingEntries = reportData.healing?.data?.entries || [];
+                const debuffAuras = reportData.debuffs?.data?.auras || [];
 
-              let totalDuration = 0;
-              const targetAura = debuffAuras.length > 0 ? debuffAuras[0] : null;
+                let totalDuration = 0;
+                const targetAura = debuffAuras.length > 0 ? debuffAuras[0] : null;
 
-              if (targetAura?.bands) {
-                 totalDuration = targetAura.bands.reduce((acc: number, band: any) => acc + (band.endTime - band.startTime), 0) / 1000;
-              }
+                if (targetAura?.bands) {
+                  totalDuration = targetAura.bands.reduce((acc: number, band: any) => acc + (band.endTime - band.startTime), 0) / 1000;
+                }
 
-              if (totalDuration > 0) {
-                 const breakdown = healingEntries
+                if (totalDuration > 0) {
+                  const breakdown = healingEntries
                     .sort((a: any, b: any) => b.total - a.total)
                     .slice(0, 6)
-                    .map((e: any) => ({
-                        name: e.name,
-                        className: e.type,
-                        icon: e.icon,
-                        total: e.total,
-                        hps: e.total / totalDuration
+                    .map((entry: any) => ({
+                      name: entry.name,
+                      className: entry.type,
+                      icon: entry.icon,
+                      total: entry.total,
+                      hps: entry.total / totalDuration
                     }));
 
-                 boss6KillDetails.push({
-                     code: kill.code,
-                     fightID: kill.fightID,
-                     startTime: kill.startTime,
-                     healerBreakdown: breakdown
-                 });
-              }
-          });
+                  details.push({
+                    code: kill.code,
+                    fightID: kill.fightID,
+                    startTime: kill.startTime,
+                    healerBreakdown: breakdown
+                  });
+                }
+              });
+              return details;
+            }
+          );
+          boss6KillDetails.push(...chunkDetails.flat());
       } catch (e) {
           // console.error(e);
       }
@@ -1041,26 +1249,43 @@ async function fetchSeason1Analysis(
 
   if (boss8TotalKills > 0) {
       try {
-          // Batch Query
-          const reportQueries = boss8Reports.map((kill, idx) => `
-              r8_${idx}: report(code: "${kill.code}") {
-                  jump: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 451278)
-                  portal: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 464056)
-                  essence: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 445152)
-              }
-          `).join('\n');
-          
-          const batchQuery = `query GetBoss8TasksBatch { reportData { ${reportQueries} } }`;
-          const result = await queryWarcraftLogs<any>(batchQuery, {});
-          
-          boss8Reports.forEach((_, idx) => {
-             const data = result.reportData?.[`r8_${idx}`];
-             
-             const checkDebuff = (auras: any[]) => auras?.some((a: any) => a.name === playerName);
-             
-             if (checkDebuff(data?.jump?.data?.auras)) boss8JumpTaskCount++;
-             if (checkDebuff(data?.portal?.data?.auras)) boss8PortalTaskCount++;
-             if (checkDebuff(data?.essence?.data?.auras)) boss8EssenceTaskCount++;
+          const reportChunks = chunkArray(boss8Reports, REPORT_QUERY_BATCH_SIZE);
+          const countChunks = await mapWithConcurrency(
+            reportChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (killChunk, chunkIndex): Promise<{ jump: number; portal: number; essence: number }> => {
+              const reportQueries = killChunk.map((kill, idx) => `
+                  r8_${chunkIndex}_${idx}: report(code: "${kill.code}") {
+                      jump: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 451278)
+                      portal: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 464056)
+                      essence: table(fightIDs: [${kill.fightID}], dataType: Debuffs, abilityID: 445152)
+                  }
+              `).join('\n');
+
+              const batchQuery = `query GetBoss8TasksBatch { reportData { ${reportQueries} } }`;
+              const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+              let jump = 0;
+              let portal = 0;
+              let essence = 0;
+
+              killChunk.forEach((_, idx) => {
+                const data = result.reportData?.[`r8_${chunkIndex}_${idx}`];
+                const checkDebuff = (auras: any[]) => auras?.some((a: any) => a.name === playerName);
+
+                if (checkDebuff(data?.jump?.data?.auras)) jump++;
+                if (checkDebuff(data?.portal?.data?.auras)) portal++;
+                if (checkDebuff(data?.essence?.data?.auras)) essence++;
+              });
+
+              return { jump, portal, essence };
+            }
+          );
+
+          countChunks.forEach(count => {
+            boss8JumpTaskCount += count.jump;
+            boss8PortalTaskCount += count.portal;
+            boss8EssenceTaskCount += count.essence;
           });
       } catch (e) { /* S1 Boss 8 Analysis Error (Silent) */ }
   }
@@ -1088,6 +1313,7 @@ async function fetchSeason3Analysis(
 ): Promise<void> {
   // Season 3 (zoneId 44)만 처리
   if (season.zoneId !== 44) return;
+  const playerNameLower = playerName.toLowerCase();
   
   // --- 2넴 분석 (DPS 전용, DPS가 Main Role일 때만) ---
   let boss2FirstKillPercent: number | null = null;
@@ -1134,21 +1360,26 @@ async function fetchSeason3Analysis(
 
       if (uniqueReports.length > 0) {
         try {
-          const reportQueries = uniqueReports.map((report, index) => 
-            `kill${index}: report(code: "${report.code}") {
-              table(fightIDs: [${report.fightID}], dataType: DamageDone)
-            }`
-          ).join('\n');
-          
-          const batchQuery = `query GetAllKillsDamage { reportData { ${reportQueries} } }`;
-          const batchResult = await queryWarcraftLogs<any>(batchQuery, {});
-          
-          uniqueReports.forEach((report, index) => {
-             const reportData = batchResult.reportData[`kill${index}`];
-             const entries = reportData?.table?.data?.entries || [];
-             
-             const breakdown = entries
-                .map((e: any) => {
+          const reportChunks = chunkArray(uniqueReports, REPORT_QUERY_BATCH_SIZE);
+          const boss2ChunkDetails = await mapWithConcurrency(
+            reportChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (chunk, chunkIndex): Promise<any[]> => {
+              const reportQueries = chunk.map((report, index) =>
+                `kill${chunkIndex}_${index}: report(code: "${report.code}") {
+                  table(fightIDs: [${report.fightID}], dataType: DamageDone)
+                }`
+              ).join('\n');
+
+              const batchQuery = `query GetAllKillsDamage { reportData { ${reportQueries} } }`;
+              const batchResult = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+              return chunk.map((report, index) => {
+                const reportData = batchResult.reportData?.[`kill${chunkIndex}_${index}`];
+                const entries = reportData?.table?.data?.entries || [];
+
+                const breakdown = entries
+                  .map((e: any) => {
                     if (!e.icon) return null;
                     const spec = e.icon.includes('-') ? e.icon.split('-')[1] : e.icon;
                     // DPS Only Check
@@ -1158,23 +1389,26 @@ async function fetchSeason3Analysis(
                     const amount = tangleTarget?.total || 0;
                     const total = e.total || 0;
                     const percent = total > 0 ? (amount / total) * 100 : 0;
-                    
+
                     return {
-                        name: e.name,
-                        className: e.type,
-                        amount,
-                        percent
+                      name: e.name,
+                      className: e.type,
+                      amount,
+                      percent
                     };
-                })
-                .filter((e: any) => e !== null)
-                .sort((a: any, b: any) => b.amount - a.amount);
-             
-             boss2KillDetails.push({
-                 ...report,
-                 myParse: (report as any).myParse,
-                 entanglementBreakdown: breakdown
-             });
-          });
+                  })
+                  .filter((e: any) => e !== null)
+                  .sort((a: any, b: any) => b.amount - a.amount);
+
+                return {
+                  ...report,
+                  myParse: (report as any).myParse,
+                  entanglementBreakdown: breakdown
+                };
+              });
+            }
+          );
+          boss2KillDetails.push(...boss2ChunkDetails.flat());
         } catch(e) { console.error("Boss 2 Analysis Error", e); }
       }
   }
@@ -1222,239 +1456,227 @@ async function fetchSeason3Analysis(
   });
 
   if (uniqueBoss8Reports.length > 0) {
-    // 1. Report Start Time들이 필요함 (DPS Query의 Offset 계산용)
-    const uniqueReportCodes = Array.from(new Set(uniqueBoss8Reports.map(k => k.code)));
-    if (uniqueReportCodes.length > 0) {
+    const boss8Reports = uniqueBoss8Reports;
+    const healerKills = uniqueBoss8Reports.filter(kill => HEALER_SPECS.some(s => kill.spec.includes(s)));
+    const dpsKills = uniqueBoss8Reports.filter(kill =>
+      !HEALER_SPECS.some(s => kill.spec.includes(s)) &&
+      !TANK_SPECS.some(s => kill.spec.includes(s))
+    );
+
+    // DPS Query의 Offset 계산에 필요한 report startTime은 DPS 킬이 있을 때만 조회
+    if (dpsKills.length > 0) {
+      const uniqueReportCodes = Array.from(new Set(dpsKills.map(k => k.code)));
+      if (uniqueReportCodes.length > 0) {
         try {
-            const timeQueries = uniqueReportCodes.map((code, idx) => `r_${idx}: report(code: "${code}") { startTime }`).join('\n');
-            const timeBatchQuery = `query GetReportStartTimes { reportData { ${timeQueries} } }`;
-            const timeResult = await queryWarcraftLogs<any>(timeBatchQuery, {});
-            
-            const codeToStartTime = new Map<string, number>();
-            uniqueReportCodes.forEach((code, idx) => {
-                const r = timeResult.reportData?.[`r_${idx}`];
-                if (r?.startTime) codeToStartTime.set(code, r.startTime);
-            });
-            uniqueBoss8Reports.forEach(kill => {
-                const st = codeToStartTime.get(kill.code);
-                if (st) kill.reportStartTime = st;
-            });
-        } catch(e) { /* Failed to fetch report start times (Silent) */ }
+          const codeChunks = chunkArray(uniqueReportCodes, REPORT_QUERY_BATCH_SIZE);
+          const startTimePairs = await mapWithConcurrency(
+            codeChunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (chunk, chunkIndex): Promise<Array<{ code: string; startTime: number }>> => {
+              const timeQueries = chunk.map((code, index) =>
+                `r_${chunkIndex}_${index}: report(code: "${code}") { startTime }`
+              ).join('\n');
+              const timeBatchQuery = `query GetReportStartTimes { reportData { ${timeQueries} } }`;
+              const timeResult = await queryWarcraftLogs<any>(timeBatchQuery, {}, { allowPartialErrors: true });
+
+              return chunk.map((code, index) => {
+                const report = timeResult.reportData?.[`r_${chunkIndex}_${index}`];
+                return { code, startTime: report?.startTime || 0 };
+              });
+            }
+          );
+
+          const codeToStartTime = new Map<string, number>();
+          startTimePairs.flat().forEach(pair => {
+            if (pair.startTime > 0) {
+              codeToStartTime.set(pair.code, pair.startTime);
+            }
+          });
+
+          dpsKills.forEach(kill => {
+            const startTime = codeToStartTime.get(kill.code);
+            if (startTime) {
+              kill.reportStartTime = startTime;
+            }
+          });
+        } catch {
+          // Failed to fetch report start times (Silent)
+        }
+      }
     }
 
-    const boss8Reports = uniqueBoss8Reports;
-    
-    // 개별 쿼리 함수 (두 가지 디버프 동시 확인 + 페이즈 디버프 시간 확인)
-    const checkBoss8Debuff = async (report: { code: string; fightID: number }) => {
-      try {
-        const query = `
-          query GetBoss8Debuffs {
-            reportData {
-              report(code: "${report.code}") {
-                special: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${BOSS_9_DEBUFF_ABILITY_ID})
-                star: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: ${BOSS_9_STAR_DEBUFF_ABILITY_ID})
-                phase: table(fightIDs: [${report.fightID}], dataType: Debuffs, abilityID: 1245292, hostilityType: Enemies)
-              }
-            }
-          }
-        `;
-        const result = await queryWarcraftLogs<{
-            reportData: { 
-              report: { 
-                special: { data?: { auras?: Array<{ name: string; totalUses: number }> } };
-                star: { data?: { auras?: Array<{ name: string; totalUses: number }> } };
-                phase: { data?: { auras?: Array<{ bands?: Array<{ startTime: number; endTime: number }> }> } };
-              } | null 
-            };
-        }>(query, {});
+    const debuffResults = await fetchBoss8DebuffAnalysisBatch(
+      boss8Reports.map(report => ({ code: report.code, fightID: report.fightID })),
+      playerNameLower
+    );
 
-        if (!result.reportData?.report) return { special: 0, star: 0 };
-        
-        const getCount = (auras: Array<{ name: string; totalUses: number }> | undefined) => {
-           return auras?.find(a => a.name.toLowerCase() === playerName.toLowerCase())?.totalUses || 0;
-        };
+    debuffResults.forEach((result, index) => {
+      boss8TotalKills++;
+      if (result.special >= 1) boss8SpecialCount++;
+      if (result.star >= 1) boss8StarCount++;
 
-        const phaseBand = result.reportData.report.phase?.data?.auras?.[0]?.bands?.[0];
-
-        return {
-           special: getCount(result.reportData.report.special?.data?.auras),
-           star: getCount(result.reportData.report.star?.data?.auras),
-           phase: phaseBand ? { startTime: phaseBand.startTime, endTime: phaseBand.endTime } : undefined
-        };
-      } catch {
-        return { special: 0, star: 0 }; // 오류 무시
-      }
-    };
-
-    const results = await Promise.allSettled(boss8Reports.map(r => checkBoss8Debuff(r)));
-    
-    results.forEach((res, index) => {
-      if (res.status === 'fulfilled') {
-        boss8TotalKills++;
-        if (res.value.special >= 1) boss8SpecialCount++;
-        if (res.value.star >= 1) boss8StarCount++;
-        
-        if (res.value.phase) {
-          boss8Reports[index].customStart = res.value.phase.startTime;
-          boss8Reports[index].customEnd = res.value.phase.endTime;
-        }
+      if (result.phase) {
+        boss8Reports[index].customStart = result.phase.startTime;
+        boss8Reports[index].customEnd = result.phase.endTime;
       }
     });
 
+    const detailTasks: Promise<void>[] = [];
 
-
-
-
-
-      // 힐러 스펙인 킬(All Kills)에 대해 별조각(Starshard) 힐량 분석 (Batch)
-      const healerKills = uniqueBoss8Reports.filter(kill => HEALER_SPECS.some(s => kill.spec.includes(s)));
-      if (healerKills.length > 0) {
+    if (healerKills.length > 0) {
+      detailTasks.push((async () => {
         try {
-            // Batch Query 생성
-            const reportQueries = healerKills.map((kill, idx) => {
-               let query = `
-               report_${idx}: report(code: "${kill.code}") {
-                  healing: table(
-                      fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "1254385"
-                  )
-                  debuffs: table(
-                      fightIDs: [${kill.fightID}], dataType: Debuffs, targetAurasPresent: "1254385"
-                  )
-               `;
-               
-               if (kill.customStart && kill.customEnd) {
-                 query += `
-                  damage: table(
-                      fightIDs: [${kill.fightID}], 
-                      dataType: DamageDone, 
-                      startTime: ${kill.customStart}, 
-                      endTime: ${kill.customEnd},
-                      filterExpression: "source.name='${playerName}' or source.owner.name='${playerName}'"
-                  )
-                 `;
-               }
-               
-               query += `}`;
-               return query;
+          const healerChunks = chunkArray(healerKills, REPORT_QUERY_BATCH_SIZE);
+          await mapWithConcurrency(healerChunks, REPORT_QUERY_CONCURRENCY, async (killChunk, chunkIndex) => {
+            const reportQueries = killChunk.map((kill, idx) => {
+              let query = `
+              report_${chunkIndex}_${idx}: report(code: "${kill.code}") {
+                healing: table(
+                  fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "1254385"
+                )
+                debuffs: table(
+                  fightIDs: [${kill.fightID}], dataType: Debuffs, targetAurasPresent: "1254385"
+                )
+              `;
+
+              if (kill.customStart && kill.customEnd) {
+                query += `
+                damage: table(
+                  fightIDs: [${kill.fightID}],
+                  dataType: DamageDone,
+                  startTime: ${kill.customStart},
+                  endTime: ${kill.customEnd},
+                  filterExpression: "source.name='${playerName}' or source.owner.name='${playerName}'"
+                )
+                `;
+              }
+
+              query += `}`;
+              return query;
             }).join('\n');
 
             const batchQuery = `
               query GetStarshardHealingBatch {
-                 reportData {
-                    ${reportQueries}
-                 }
+                reportData {
+                  ${reportQueries}
+                }
               }
             `;
-            
-            const result = await queryWarcraftLogs<any>(batchQuery, {});
-            
-            // 결과 파싱 및 할당
-            healerKills.forEach((kill, idx) => {
-                 const reportData = result.reportData?.[`report_${idx}`];
-                 if (reportData) {
-                    const healingEntries = reportData.healing?.data?.entries;
-                    const debuffAuras = reportData.debuffs?.data?.auras;
-                    const damageEntries = reportData.damage?.data?.entries;
-                    
-                    if (damageEntries && damageEntries.length > 0) {
-                        (kill as any).phaseDamage = damageEntries[0].total;
-                    } else if (kill.customStart) {
-                         (kill as any).phaseDamage = 0;
-                    }
-                    
-                    if (healingEntries && debuffAuras) {
-                        const starshardAura = debuffAuras.find((a: any) => a.name === "Starshard");
-                        const bands = starshardAura?.bands;
-                        if (bands && bands.length > 0) {
-                           const totalDuration = bands.reduce((sum: number, band: any) => sum + (band.endTime - band.startTime), 0) / 1000;
-                           if (totalDuration > 0) {
-                               (kill as any).healerBreakdown = healingEntries
-                                 .sort((a: any, b: any) => b.total - a.total)
-                                 .slice(0, 6)
-                                 .map((entry: any) => ({
-                                    name: entry.name,
-                                    icon: entry.icon,
-                                    total: entry.total,
-                                    hps: entry.total / totalDuration
-                                 }));
-                           }
-                        }
-                    }
-                 }
-            });
 
-        } catch (e) { console.error(`[Boss9 Batch Debug] Error:`, e); }
-      }
+            const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
 
-      // [New] DPS 스펙인 킬에 대해 공허(1228206) 내부에서의 피격 분석 (Batch)
-      const dpsKills = uniqueBoss8Reports.filter(kill => 
-          !HEALER_SPECS.some(s => kill.spec.includes(s)) && 
-          !TANK_SPECS.some(s => kill.spec.includes(s))
-      );
-      
-      if (dpsKills.length > 0) {
-          try {
-              const dpsQueries = dpsKills.map((kill, idx) => {
-                 // Calculate Relative Start Time for Query (Offset)
-                 const fightOffset = kill.startTime - kill.reportStartTime;
-                 const queryStart = fightOffset > 0 ? fightOffset + 25000 : 0; // 25초부터
-                 const queryEnd = fightOffset > 0 ? fightOffset + 180000 : 9999999999; // 3분까지
-                 
-                 const timeParams = (kill.reportStartTime > 0) 
-                    ? `startTime: ${queryStart}, endTime: ${queryEnd},` 
-                    : '';
+            killChunk.forEach((kill, idx) => {
+              const reportData = result.reportData?.[`report_${chunkIndex}_${idx}`];
+              if (!reportData) return;
 
-                 return `
-                 dps_${idx}: report(code: "${kill.code}") {
-                    hits: table(
-                        fightIDs: [${kill.fightID}], 
-                        dataType: DamageTaken,
-                        abilityID: 1243702,
-                        ${timeParams}
-                    )
-                    hits_void: table(
-                        fightIDs: [${kill.fightID}], 
-                        dataType: DamageTaken,
-                        abilityID: 1243702,
-                        targetAurasPresent: "1228206",
-                        ${timeParams}
-                    )
-                 }`;
-              }).join('\n');
-              
-              const batchQuery = `
-                query GetDPSHitsBatch {
-                    reportData {
-                        ${dpsQueries}
-                    }
-                }
-              `;
-              
-              const result = await queryWarcraftLogs<any>(batchQuery, {});
-              
-              dpsKills.forEach((kill, idx) => {
-                  const reportData = result.reportData?.[`dps_${idx}`];
-                  const hitsEntries = reportData?.hits?.data?.entries || [];
-                  const voidEntries = reportData?.hits_void?.data?.entries || [];
-                  
-                  const voidMap = new Set();
-                  voidEntries.forEach((e: any) => voidMap.add(e.name));
+              const healingEntries = reportData.healing?.data?.entries;
+              const debuffAuras = reportData.debuffs?.data?.auras;
+              const damageEntries = reportData.damage?.data?.entries;
 
-                  if (hitsEntries.length > 0) {
-                      (kill as any).hitsBreakdown = hitsEntries
-                          .map((entry: any) => ({
-                              name: entry.name,
-                              className: entry.type,
-                              icon: entry.icon,
-                              hitCount: entry.hitCount || 0,
-                              hasVoidHit: voidMap.has(entry.name)
-                          }))
-                          .sort((a: any, b: any) => b.hitCount - a.hitCount);
+              if (damageEntries && damageEntries.length > 0) {
+                (kill as any).phaseDamage = damageEntries[0].total;
+              } else if (kill.customStart) {
+                (kill as any).phaseDamage = 0;
+              }
+
+              if (healingEntries && debuffAuras) {
+                const starshardAura = debuffAuras.find((a: any) => a.name === "Starshard");
+                const bands = starshardAura?.bands;
+                if (bands && bands.length > 0) {
+                  const totalDuration = bands.reduce((sum: number, band: any) => sum + (band.endTime - band.startTime), 0) / 1000;
+                  if (totalDuration > 0) {
+                    (kill as any).healerBreakdown = healingEntries
+                      .sort((a: any, b: any) => b.total - a.total)
+                      .slice(0, 6)
+                      .map((entry: any) => ({
+                        name: entry.name,
+                        icon: entry.icon,
+                        total: entry.total,
+                        hps: entry.total / totalDuration
+                      }));
                   }
-              });
-          } catch (e) { console.error(`[DPS Batch Debug] Error:`, e); }
-      }
+                }
+              }
+            });
+          });
+        } catch (e) {
+          console.error(`[Boss9 Batch Debug] Error:`, e);
+        }
+      })());
     }
+
+    if (dpsKills.length > 0) {
+      detailTasks.push((async () => {
+        try {
+          const dpsChunks = chunkArray(dpsKills, REPORT_QUERY_BATCH_SIZE);
+          await mapWithConcurrency(dpsChunks, REPORT_QUERY_CONCURRENCY, async (killChunk, chunkIndex) => {
+            const dpsQueries = killChunk.map((kill, idx) => {
+              // Calculate Relative Start Time for Query (Offset)
+              const fightOffset = kill.startTime - kill.reportStartTime;
+              const queryStart = fightOffset > 0 ? fightOffset + 25000 : 0; // 25초부터
+              const queryEnd = fightOffset > 0 ? fightOffset + 180000 : 9999999999; // 3분까지
+
+              const timeParams = (kill.reportStartTime > 0)
+                ? `startTime: ${queryStart}, endTime: ${queryEnd},`
+                : '';
+
+              return `
+              dps_${chunkIndex}_${idx}: report(code: "${kill.code}") {
+                hits: table(
+                  fightIDs: [${kill.fightID}],
+                  dataType: DamageTaken,
+                  abilityID: 1243702,
+                  ${timeParams}
+                )
+                hits_void: table(
+                  fightIDs: [${kill.fightID}],
+                  dataType: DamageTaken,
+                  abilityID: 1243702,
+                  targetAurasPresent: "1228206",
+                  ${timeParams}
+                )
+              }`;
+            }).join('\n');
+
+            const batchQuery = `
+              query GetDPSHitsBatch {
+                reportData {
+                  ${dpsQueries}
+                }
+              }
+            `;
+
+            const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+            killChunk.forEach((kill, idx) => {
+              const reportData = result.reportData?.[`dps_${chunkIndex}_${idx}`];
+              const hitsEntries = reportData?.hits?.data?.entries || [];
+              const voidEntries = reportData?.hits_void?.data?.entries || [];
+
+              const voidMap = new Set();
+              voidEntries.forEach((entry: any) => voidMap.add(entry.name));
+
+              if (hitsEntries.length > 0) {
+                (kill as any).hitsBreakdown = hitsEntries
+                  .map((entry: any) => ({
+                    name: entry.name,
+                    className: entry.type,
+                    icon: entry.icon,
+                    hitCount: entry.hitCount || 0,
+                    hasVoidHit: voidMap.has(entry.name)
+                  }))
+                  .sort((a: any, b: any) => b.hitCount - a.hitCount);
+              }
+            });
+          });
+        } catch (e) {
+          console.error(`[DPS Batch Debug] Error:`, e);
+        }
+      })());
+    }
+
+    await Promise.all(detailTasks);
+  }
   
 
   // --- Boss 7: 1227549 Healing Analysis (Healers) ---
@@ -1490,35 +1712,45 @@ async function fetchSeason3Analysis(
   const boss7HealingDetails: any[] = [];
   if (healerBoss7Kills.length > 0) {
       try {
-          const reportQueries = healerBoss7Kills.map((kill, idx) => `
-              r7_${idx}: report(code: "${kill.code}") {
-                  healing: table(fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "1227549")
-              }
-          `).join('\n');
-          
-          const batchQuery = `query GetBoss7HealingBatch { reportData { ${reportQueries} } }`;
-          const result = await queryWarcraftLogs<any>(batchQuery, {});
-          
-          healerBoss7Kills.forEach((kill, idx) => {
-               const reportData = result.reportData?.[`r7_${idx}`];
-               const healingEntries = reportData?.healing?.data?.entries || [];
-               
-               const breakdown = healingEntries.map((e: any) => ({
-                   name: e.name,
-                   className: e.type,
-                   icon: e.icon,
-                   total: e.total // Raw Healing
-               })).sort((a: any, b: any) => b.total - a.total);
-               
-               if (breakdown.length > 0) {
-                   boss7HealingDetails.push({
-                       code: kill.code,
-                       fightID: kill.fightID,
-                       startTime: kill.startTime,
-                       breakdown
-                   });
-               }
-          });
+          const boss7Chunks = chunkArray(healerBoss7Kills, REPORT_QUERY_BATCH_SIZE);
+          const boss7ChunkResults = await mapWithConcurrency(
+            boss7Chunks,
+            REPORT_QUERY_CONCURRENCY,
+            async (killChunk, chunkIndex): Promise<any[]> => {
+              const reportQueries = killChunk.map((kill, idx) => `
+                  r7_${chunkIndex}_${idx}: report(code: "${kill.code}") {
+                      healing: table(fightIDs: [${kill.fightID}], dataType: Healing, targetAurasPresent: "1227549")
+                  }
+              `).join('\n');
+
+              const batchQuery = `query GetBoss7HealingBatch { reportData { ${reportQueries} } }`;
+              const result = await queryWarcraftLogs<any>(batchQuery, {}, { allowPartialErrors: true });
+
+              const details: any[] = [];
+              killChunk.forEach((kill, idx) => {
+                const reportData = result.reportData?.[`r7_${chunkIndex}_${idx}`];
+                const healingEntries = reportData?.healing?.data?.entries || [];
+
+                const breakdown = healingEntries.map((e: any) => ({
+                  name: e.name,
+                  className: e.type,
+                  icon: e.icon,
+                  total: e.total // Raw Healing
+                })).sort((a: any, b: any) => b.total - a.total);
+
+                if (breakdown.length > 0) {
+                  details.push({
+                    code: kill.code,
+                    fightID: kill.fightID,
+                    startTime: kill.startTime,
+                    breakdown
+                  });
+                }
+              });
+              return details;
+            }
+          );
+          boss7HealingDetails.push(...boss7ChunkResults.flat());
       } catch (e) {
           // console.error("Boss 7 Analysis Error", e);
       }

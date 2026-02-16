@@ -90,6 +90,7 @@ interface SeasonTableProps {
   analysisResult?: AnalysisResult;
   onSeasonUpdate?: (season: SeasonData) => void;
   showTableByDefault?: boolean;  // SeasonCard에서 사용할 때 true
+  analysisLoading?: boolean;
 }
 
 // 역할별 색상 (아이콘은 스펙 이미지로 대체)
@@ -238,7 +239,7 @@ const POWER_INFUSION_MIN_COUNT = 2;  // 2회 이상이면 아이콘 표시
 
 
 
-export function SeasonTable({ season, classID, analysisResult, onSeasonUpdate, showTableByDefault = false }: SeasonTableProps) {
+export function SeasonTable({ season, classID, analysisResult, onSeasonUpdate, showTableByDefault = false, analysisLoading = false }: SeasonTableProps) {
   const [chartIndex, setChartIndex] = useState(0);
   const [boss1ChartIndex, setBoss1ChartIndex] = useState(0);
   const [boss2ChartIndex, setBoss2ChartIndex] = useState(0);
@@ -914,9 +915,18 @@ export function SeasonTable({ season, classID, analysisResult, onSeasonUpdate, s
           <p className="text-sm">역할 버튼을 클릭하여 보스별 데이터를 확인하세요</p>
         </div>
       )}
+
+      {showTableByDefault && analysisLoading && (
+        <div className="px-4 pb-4 pt-2">
+          <div className="rounded-xl border border-purple-500/40 bg-purple-500/10 px-6 py-10 text-center">
+            <p className="text-lg font-bold text-purple-200 mb-2">추가 분석 데이터 업데이트 중...</p>
+            <p className="text-sm text-purple-300/80">완료되면 막넴 분석 / 기타 분석 박스가 자동으로 표시됩니다.</p>
+          </div>
+        </div>
+      )}
       
       {/* 분석 섹션 - 2개의 셀 */}
-      {showTableByDefault && (
+      {showTableByDefault && !analysisLoading && (
         <div className="px-4 pb-4 pt-2">
           <div className="grid grid-cols-2 gap-3">
             {/* 막넴 퍼킬 분석 */}

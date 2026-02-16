@@ -56,6 +56,7 @@ interface SeasonCardProps {
 
 export function SeasonCard({ status, searchParams, classID }: SeasonCardProps) {
   const [loading, setLoading] = useState(false);
+  const [backgroundAnalysisLoading, setBackgroundAnalysisLoading] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [seasonData, setSeasonData] = useState<SeasonData | null>(null);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
@@ -142,20 +143,27 @@ export function SeasonCard({ status, searchParams, classID }: SeasonCardProps) {
       
       if (result && result.seasons.length > 0) {
         const season = result.seasons[0];
-        
-        // 상세 분석도 함께 실행
+
+        // 기본 데이터 먼저 표시하고, 상세 분석은 백그라운드에서 처리
+        setSeasonData({ ...season });
+        setAnalysisResult(result);
+        setExpanded(true);
+
         if (result._ranksData) {
-          await fetchDetailedAnalysis(
+          setBackgroundAnalysisLoading(true);
+          void fetchDetailedAnalysis(
             season,
             result.playerName,
             result._ranksData.dpsRanksMap,
             result._ranksData.hpsRanksMap
-          );
+          ).then(() => {
+            setSeasonData({ ...season });
+          }).catch((error) => {
+            console.error('상세 분석 백그라운드 로딩 실패:', error);
+          }).finally(() => {
+            setBackgroundAnalysisLoading(false);
+          });
         }
-        
-        setSeasonData({ ...season });
-        setAnalysisResult(result);
-        setExpanded(true);
       }
     } catch (error) {
       console.error('상세 데이터 로딩 실패:', error);
@@ -278,6 +286,12 @@ export function SeasonCard({ status, searchParams, classID }: SeasonCardProps) {
       </div>
       
       {/* 상세 테이블 (로드 후 표시) */}
+      {expanded && backgroundAnalysisLoading && (
+        <div className="px-4 py-2 text-xs text-purple-300 border-t border-purple-500/30 bg-purple-500/5">
+          추가 분석 데이터 업데이트 중...
+        </div>
+      )}
+
       {expanded && seasonData && (
         <SeasonTable 
           season={seasonData} 
@@ -285,6 +299,7 @@ export function SeasonCard({ status, searchParams, classID }: SeasonCardProps) {
           analysisResult={analysisResult ?? undefined}
           onSeasonUpdate={setSeasonData}
           showTableByDefault={true}
+          analysisLoading={backgroundAnalysisLoading}
         />
       )}
     </div>
